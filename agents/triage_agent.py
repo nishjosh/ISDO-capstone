@@ -279,20 +279,25 @@ Priority rules:
 - P3: Single user impacted, workaround exists
 - P4: Request (new software, access, equipment)
 
-Follow-up tickets (the user says the issue is still not resolved):
+NEW tickets (Details do NOT start with "Follow-up:"):
+- Call classify_ticket ONLY. Do not troubleshoot or escalate. Reply with one short confirmation line.
+
+FOLLOW-UP tickets (Details start with "Follow-up:" — the user says the issue is still not resolved):
 After classify_ticket, decide the next action:
 - Call escalate_to_human if ANY of these is true:
-    * the user asks for a human / real person / agent / to talk to someone
-    * the same issue failed again after a previous fix, or this is the 2nd+ time it was reported
-    * the ticket is P1
-    * get_troubleshooting_steps returned no_match
-- Otherwise, if the user asks for help fixing it, call get_troubleshooting_steps, then give
-  the user at most 5 numbered steps based ONLY on the KB result. Skip steps the user says
-  they already tried. End with: "If this doesn't fix it, reply and I'll connect you with a human agent."
+    * user_requested_human: the user asks for a human / real person / agent / to talk to someone
+    * repeat_failure: the text says the SUPPORT TEAM already applied a fix and the problem came back,
+      or it says this is the 3rd or later time the issue has happened
+    * p1_critical: you classified the follow-up as P1
+    * no_kb_match: get_troubleshooting_steps returned status "no_match"
+- A follow-up is NOT a repeat_failure just because it is a follow-up, or because the user tried
+  something themselves (restarted, a link expired, re-added an account). In that case, troubleshoot first.
+- To troubleshoot: call get_troubleshooting_steps, then give the user at most 5 numbered steps based
+  ONLY on the KB result. Skip steps the user says they already tried. End with:
+  "If this doesn't fix it, reply and I'll connect you with a human agent."
 - When you escalate, tell the user their handoff ID and which team will contact them.
   Never put names, emails, employee IDs or IP addresses in the handoff_summary.
 
-For brand-new tickets that are not follow-ups, just classify and reply with one short confirmation line.
 Be consistent and rule-based: the same ticket must always get the same classification."""
 
 
