@@ -1,14 +1,15 @@
 """
-ISDO Lab C6 - LangGraph Orchestrator
+ISDO Lab C6/C7 - LangGraph Orchestrator with extended HITL gate
 Wires the Triage, Resolution, SLA, HITL and Communication agents (Labs C3-C5)
 into a single StateGraph.
 
 Flow:
     triage -> resolution -> sla -> [hitl if hitl_required] -> communication
 
-hitl_required is set only for P1 tickets at CRITICAL/BREACHED SLA risk (same
-rule used standalone in Lab C5). Non-P1 CRITICAL/BREACHED tickets still get
-escalated, just without a human pause, matching Lab C5's escalation rule.
+C7: the HITL gate fires for ANY of these (hitl_reason says which):
+    1. P1 ticket with SLA CRITICAL/BREACHED            (from C6)
+    2. Resolution Agent confidence is LOW              (any priority)
+    3. category 'Access' + request_type 'Access Grant' (security-sensitive)
 
 Run from the project root:  python agents/orchestrator/supervisor.py
 """
@@ -40,6 +41,7 @@ class TicketState(TypedDict, total=False):
     category: str
     priority: str
     sla_due: str
+    request_type: str              # C7: e.g. 'Access Grant' for REQ- tickets
     # Triage agent
     triage_category: str
     triage_priority: str
@@ -54,6 +56,8 @@ class TicketState(TypedDict, total=False):
     sla_breach_risk: str
     escalation_required: bool
     hitl_required: bool
+    hitl_reason: str               # C7: why the HITL gate fired (one or more triggers)
+    access_grant: bool             # C7: True if this is an access grant request
     # HITL node
     hitl_approved: Optional[bool]
     escalation_team: Optional[str]
@@ -115,57 +119,98 @@ def resolution_node(state: TicketState) -> dict:
 def sla_node(state: TicketState) -> dict:
     print(f"\n\u25b6 SLA AGENT \u2014 checking deadline")
 
-    status = sla_agent.get_sla_status(state["ticket_number"], state["sla_due"], state["triage_priority"])
+    priority = state["triage_priority"]
+    status = sla_agent.get_sla_status(state["ticket_number"], state["sla_due"], priority)
     breach_risk = status.get("breach_risk", "ON_TRACK")
     escalation_required = bool(status.get("requires_escalation"))
-    # HITL gate: only P1 tickets at CRITICAL/BREACHED pause for a human (Lab C5's rule).
-    hitl_required = escalation_required and state["triage_priority"] == "P1"
-
     print(f"  SLA Risk: {breach_risk}  |  Minutes remaining: {status.get('minutes_remaining')}")
+
+    # C7: check every HITL trigger and collect the reasons
+    reasons = []
+    if escalation_required and priority == "P1":
+        reasons.append(f"P1 SLA {breach_risk} \u2014 escalation needs approval")
+    if state.get("confidence") == "LOW":
+        reasons.append("LOW KB CONFIDENCE \u2014 no clear fix found, human must decide next action")
+    is_access = "Access" in (state.get("category"), state.get("triage_category"))
+    access_grant = is_access and state.get("request_type") == "Access Grant"
+    if access_grant:
+        reasons.append(f"ACCESS GRANT \u2014 {state['short_description']} requires security approval")
+
+    hitl_required = bool(reasons)
+    hitl_reason = " | ".join(reasons)
+    if hitl_required:
+        print(f"  HITL required: {hitl_reason}")
 
     return {
         "sla_breach_risk": breach_risk,
         "escalation_required": escalation_required,
         "hitl_required": hitl_required,
+        "hitl_reason": hitl_reason,
+        "access_grant": access_grant,
+        # a ticket that needs a human can never be auto-resolved
+        "auto_resolve": state.get("auto_resolve", False) and not hitl_required,
         "escalation_team": sla_agent.ESCALATION_TEAMS.get(state["triage_category"], "L2-Service-Desk"),
-        "audit_log": log("SLAAgent", "get_sla_status", f"{breach_risk} ({status.get('minutes_remaining')} min remaining)"),
+        "audit_log": log("SLAAgent", "get_sla_status",
+                         f"{breach_risk} ({status.get('minutes_remaining')} min remaining)"
+                         + (f"; HITL: {hitl_reason}" if hitl_required else "")),
     }
 
 
 def hitl_node(state: TicketState) -> dict:
-    approved = sla_agent.hitl_approve(state["ticket_number"], "Escalate ticket",
-                                       f"Escalate to {state['escalation_team']}")
-    if approved:
-        sla_agent.update_ticket(state["ticket_number"], "escalate", escalation_team=state["escalation_team"])
-        detail = f"Approved - escalated to {state['escalation_team']}"
-    else:
-        detail = "Rejected by human approver - escalation cancelled"
+    print(f"\n\u25b6 HITL GATE \u2014 human approval required")
+    print(f"  {'WARNING ' * 8}")
+    print(f"  Ticket: {state['ticket_number']} | Priority: {state['triage_priority']}")
+    for reason in state["hitl_reason"].split(" | "):
+        print(f"  Reason: {reason}")
+    print(f"  {'WARNING ' * 8}")
+    try:
+        approved = input("  Approve action? [y/n]: ").strip().lower() == "y"
+    except EOFError:                              # nobody at the keyboard -> NO
+        approved = False
+    decision = "APPROVED" if approved else "REJECTED"
 
-    return {"hitl_approved": approved, "audit_log": log("HITLGate", "approve_escalation", detail)}
+    # Only a P1 SLA escalation changes the ticket in ServiceNow; other triggers just need sign-off
+    if approved and state.get("escalation_required") and state["triage_priority"] == "P1":
+        sla_agent.update_ticket(state["ticket_number"], "escalate", escalation_team=state["escalation_team"])
+
+    entry = log("HITLGate", "approval_decision", f"{decision} \u2014 {state['hitl_reason']}")
+    print(f"  [AUDIT] HITLGate: approval_decision \u2014 {decision}")
+    print(f"  Decision: {decision}")
+    return {"hitl_approved": approved, "audit_log": entry}
 
 
 def communication_node(state: TicketState) -> dict:
     print(f"\n\u25b6 COMMUNICATION AGENT")
 
     ticket = state["ticket_number"]
+    approved = state.get("hitl_approved")
     if state.get("auto_resolve"):
         message = (f"Dear User, regarding {ticket}: we found a known fix for this issue "
                     f"({state.get('kb_article')}) and applied it automatically.\n\n{state.get('resolution_text')}")
         final_status = "RESOLVED"
-    elif state.get("hitl_approved") is True:
+    elif state.get("hitl_required") and approved is False:
+        # C7: rejected by the human -> 'pending approval', never a resolution
+        message = (f"Dear User, regarding {ticket}: your request is pending approval by the service desk. "
+                    f"We will update you once a decision has been made.")
+        final_status = "PENDING APPROVAL"
+    elif state.get("access_grant") and approved:
+        message = (f"Dear Requester, your access grant request {ticket} has been approved by security. "
+                    f"{state.get('triage_assignment_group')} will set up the access and confirm with you.")
+        final_status = "ACCESS APPROVED"
+    elif approved and state.get("escalation_required"):
         message = (f"Dear User, regarding {ticket}: this ticket has been escalated to "
                     f"{state.get('escalation_team')} following approval. You will be contacted shortly.")
         final_status = "ESCALATED"
-    elif state.get("hitl_approved") is False:
-        message = (f"Dear User, regarding {ticket}: escalation was reviewed and held for manual handling "
-                    f"by {state.get('triage_assignment_group')}.")
-        final_status = "ESCALATION REJECTED - MANUAL REVIEW"
+    elif approved and state.get("confidence") == "LOW":
+        message = (f"Dear User, regarding {ticket}: we could not find a known fix, so an L2 specialist "
+                    f"from {state.get('escalation_team')} has been assigned to investigate.")
+        final_status = "ASSIGNED TO L2"
     else:
         message = (f"Dear User, regarding {ticket}: your ticket has been assigned to "
                     f"{state.get('triage_assignment_group')} and is being worked on.")
         final_status = "ASSIGNED"
 
-    print(f"  USER MESSAGE: {message.splitlines()[0][:80]}...")
+    print(f"  USER MESSAGE: {message.splitlines()[0][:100]}...")
     print(f"\u2705 FINAL STATUS: {final_status}")
 
     return {"user_message": message, "final_status": final_status,
@@ -206,10 +251,17 @@ if __name__ == "__main__":
         {"ticket_number": "INC0001001", "short_description": "VPN not connecting after password change",
          "description": "User reports VPN client fails to connect after AD password was reset. Error: authentication failed.",
          "category": "Network", "priority": "P2", "sla_due": "2024-01-15 12:00:00"},
+        # C7 Step 3: to test LOW confidence, change the short_description above to
+        #   "Cisco Webex not launching on MacBook M2 after Sonoma update"
         # P1 SAP outage - sla_due picked for CRITICAL (10 of 60 min = 16.7%), same as Lab C5.
         {"ticket_number": "INC0001002", "short_description": "Cannot access ERP system - login error",
          "description": "Multiple Finance users unable to login to SAP. Error: DBCON_FAIL.",
          "category": "Application", "priority": "P1", "sla_due": "2024-01-15 10:40:00"},
+        # C7 Step 4: access grant request - always goes through HITL, whatever the priority
+        {"ticket_number": "REQ-1002", "short_description": "VPN access for new contractor",
+         "description": "Contractor needs VPN access. Email: contractor@client.com",
+         "category": "Access", "priority": "P2", "sla_due": "2024-01-15 15:00:00",
+         "request_type": "Access Grant"},
     ]
 
     all_results = []
