@@ -11,6 +11,10 @@ C7: the HITL gate fires for ANY of these (hitl_reason says which):
     2. Resolution Agent confidence is LOW              (any priority)
     3. category 'Access' + request_type 'Access Grant' (security-sensitive)
 
+C8: when ChromaDB confidence is LOW, resolution_node asks the A2A Knowledge
+Specialist (a2a/knowledge_specialist.py on port 8001) for a deeper answer.
+If the specialist is not running, the ticket stays LOW and goes to HITL.
+
 Run from the project root:  python agents/orchestrator/supervisor.py
 """
 
@@ -20,7 +24,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, List, Optional, TypedDict
 
+import requests
 from langgraph.graph import END, START, StateGraph
+
+A2A_URL = "http://localhost:8001"     # C8: Knowledge Specialist (uvicorn ... --port 8001)
 
 # Project root = the first parent folder that contains "agents" and "data"
 # (works whether this file is in orchestrator/ or agents/orchestrator/)
@@ -52,6 +59,8 @@ class TicketState(TypedDict, total=False):
     resolution_text: str
     auto_resolve: bool
     confidence: str
+    a2a_status: str                # C8: not_needed / completed / unavailable / error
+    a2a_task_id: str               # C8: task id returned by the Knowledge Specialist
     # SLA agent
     sla_breach_risk: str
     escalation_required: bool
@@ -97,6 +106,27 @@ def triage_node(state: TicketState) -> dict:
     }
 
 
+def call_knowledge_specialist(state: TicketState) -> dict:
+    """C8: A2A call. POST /tasks -> task_id, then GET /tasks/{task_id} -> result.
+    Returns {'status': 'completed', 'task_id', 'result'} or {'status': 'unavailable'|'error', 'error'}."""
+    query = f"{state['short_description']}. {state['description']}"
+    try:
+        created = requests.post(f"{A2A_URL}/tasks", timeout=90, json={
+            "query": query, "ticket_number": state["ticket_number"],
+            "context": f"Category: {state.get('triage_category')}, Priority: {state.get('triage_priority')}"})
+        created.raise_for_status()
+        task_id = created.json()["task_id"]
+        print(f"  -> A2A task created: {task_id}")
+
+        task = requests.get(f"{A2A_URL}/tasks/{task_id}", timeout=30)
+        task.raise_for_status()
+        return {"status": "completed", "task_id": task_id, "result": task.json()["result"]}
+    except requests.exceptions.ConnectionError:
+        return {"status": "unavailable", "error": f"Knowledge Specialist not running at {A2A_URL}"}
+    except (requests.exceptions.RequestException, KeyError, ValueError) as e:
+        return {"status": "error", "error": f"{type(e).__name__}: {e}"}
+
+
 def resolution_node(state: TicketState) -> dict:
     print(f"\n\u25b6 RESOLUTION AGENT \u2014 searching KB")
 
@@ -104,16 +134,44 @@ def resolution_node(state: TicketState) -> dict:
         state["ticket_number"], state["short_description"], state["description"],
         state["triage_category"], state["triage_priority"],
     )
-
-    return {
+    update = {
         "kb_article": result.get("kb_article_used", "None"),
         "resolution_text": result.get("resolution_text", ""),
         "auto_resolve": bool(result.get("auto_resolve")),
         "confidence": result.get("confidence", "LOW"),
+        "a2a_status": "not_needed",
         "audit_log": log("ResolutionAgent", "search_kb",
                           f"{result.get('kb_article_used', 'None')} - {result.get('confidence')} "
                           f"({result.get('top_score', 0):.0%})"),
     }
+    if update["confidence"] != "LOW":
+        return update
+
+    # C8: ChromaDB confidence is LOW -> ask the Knowledge Specialist agent via A2A
+    print(f"\n\u25b6 A2A CALL \u2014 Knowledge Specialist ({A2A_URL})")
+    a2a = call_knowledge_specialist(state)
+    update["a2a_status"] = a2a["status"]
+
+    if a2a["status"] == "completed":
+        r = a2a["result"]
+        print(f"  -> A2A result: {r.get('best_match')} | {r.get('confidence')} "
+              f"({r.get('confidence_score', 0):.0%}) | escalate_to_l2: {r.get('escalate_to_l2')}")
+        update.update({
+            "a2a_task_id": a2a["task_id"],
+            "kb_article": r.get("best_match", update["kb_article"]),
+            "resolution_text": r.get("resolution", update["resolution_text"]),
+            "confidence": r.get("confidence", "LOW"),
+            "auto_resolve": False,     # specialist answers go to an L2 engineer, never straight to the user
+        })
+        update["audit_log"] = update["audit_log"] + log(
+            "KnowledgeSpecialist", "a2a_task",
+            f"task {a2a['task_id']}: {r.get('best_match')} - {r.get('confidence')} ({r.get('confidence_score', 0):.0%})")
+    else:
+        # Fallback: keep confidence LOW -> sla_node will route the ticket to HITL
+        print(f"  ! A2A {a2a['status']}: {a2a['error']} \u2014 falling back to HITL")
+        update["audit_log"] = update["audit_log"] + log("KnowledgeSpecialist", "a2a_task",
+                                                        f"{a2a['status'].upper()} - {a2a['error']}")
+    return update
 
 
 def sla_node(state: TicketState) -> dict:
@@ -130,7 +188,10 @@ def sla_node(state: TicketState) -> dict:
     if escalation_required and priority == "P1":
         reasons.append(f"P1 SLA {breach_risk} \u2014 escalation needs approval")
     if state.get("confidence") == "LOW":
-        reasons.append("LOW KB CONFIDENCE \u2014 no clear fix found, human must decide next action")
+        extra = {"unavailable": " (A2A Knowledge Specialist not running)",
+                 "error": " (A2A call failed)",
+                 "completed": " (A2A Knowledge Specialist also LOW)"}.get(state.get("a2a_status"), "")
+        reasons.append(f"LOW KB CONFIDENCE{extra} \u2014 no clear fix found, human must decide next action")
     is_access = "Access" in (state.get("category"), state.get("triage_category"))
     access_grant = is_access and state.get("request_type") == "Access Grant"
     if access_grant:
@@ -201,6 +262,10 @@ def communication_node(state: TicketState) -> dict:
         message = (f"Dear User, regarding {ticket}: this ticket has been escalated to "
                     f"{state.get('escalation_team')} following approval. You will be contacted shortly.")
         final_status = "ESCALATED"
+    elif state.get("a2a_status") == "completed" and not state.get("hitl_required"):
+        message = (f"Dear User, regarding {ticket}: our Knowledge Specialist has prepared a detailed fix, "
+                    f"and {state.get('triage_assignment_group')} will apply it and keep you updated.")
+        final_status = "ASSIGNED WITH SPECIALIST FIX"
     elif approved and state.get("confidence") == "LOW":
         message = (f"Dear User, regarding {ticket}: we could not find a known fix, so an L2 specialist "
                     f"from {state.get('escalation_team')} has been assigned to investigate.")
@@ -257,6 +322,10 @@ if __name__ == "__main__":
         {"ticket_number": "INC0001002", "short_description": "Cannot access ERP system - login error",
          "description": "Multiple Finance users unable to login to SAP. Error: DBCON_FAIL.",
          "category": "Application", "priority": "P1", "sla_due": "2024-01-15 10:40:00"},
+        # C8: low-confidence ticket (nothing about Webex in the KB) -> A2A call to the Knowledge Specialist
+        {"ticket_number": "INC0001016", "short_description": "Cisco Webex not launching on MacBook M2 after Sonoma update",
+         "description": "Webex app crashes on launch since the macOS Sonoma update. Single user, reinstall did not help.",
+         "category": "Software", "priority": "P3", "sla_due": "2024-01-15 17:00:00"},
         # C7 Step 4: access grant request - always goes through HITL, whatever the priority
         {"ticket_number": "REQ-1002", "short_description": "VPN access for new contractor",
          "description": "Contractor needs VPN access. Email: contractor@client.com",
