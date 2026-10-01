@@ -15,6 +15,12 @@ C8: when ChromaDB confidence is LOW, resolution_node asks the A2A Knowledge
 Specialist (a2a/knowledge_specialist.py on port 8001) for a deeper answer.
 If the specialist is not running, the ticket stays LOW and goes to HITL.
 
+C9: PII guardrail + audit trail. triage_node redacts names, emails, IDs, phones
+and usernames BEFORE any text reaches Claude (or the A2A server); every later node
+uses the masked text. communication_node restores the real values only in the final
+message sent to the ServiceNow mock. After the run, every audit entry is written to
+logs/audit_trail.jsonl through a single AuditLogger.
+
 Run from the project root:  python agents/orchestrator/supervisor.py
 """
 
@@ -34,6 +40,9 @@ A2A_URL = "http://localhost:8001"     # C8: Knowledge Specialist (uvicorn ... --
 ROOT = next(p for p in Path(__file__).resolve().parents if (p / "agents").is_dir() and (p / "data").is_dir())
 sys.path.insert(0, str(ROOT / "agents"))
 
+sys.path.insert(0, str(ROOT / "guardrails"))
+
+from pii_redactor import AuditLogger, redact, restore   # noqa: E402  (C9 guardrail)
 import resolution_agent   # noqa: E402  (path set above)
 import sla_agent          # noqa: E402
 import triage_agent       # noqa: E402
@@ -48,6 +57,10 @@ class TicketState(TypedDict, total=False):
     category: str
     priority: str
     sla_due: str
+    # C9: PII guardrail - only the clean_* fields are ever sent to Claude
+    clean_short_description: str
+    clean_description: str
+    pii_mapping: dict              # token -> original value, used only by restore()
     request_type: str              # C7: e.g. 'Access Grant' for REQ- tickets
     # Triage agent
     triage_category: str
@@ -87,9 +100,17 @@ def triage_node(state: TicketState) -> dict:
     print(f"\n{'#' * 60}")
     print(f"PROCESSING TICKET: {state['ticket_number']}")
     print(f"{'#' * 60}")
-    print(f"\n\u25b6 TRIAGE AGENT \u2014 {state['ticket_number']}")
+    # C9: mask PII once, on both fields together, so the same person gets the same token everywhere
+    sep = "\n\u2016\n"
+    clean_text, mapping = redact(state["short_description"] + sep + state["description"])
+    clean_short, clean_desc = clean_text.split(sep, 1)
+    print(f"\n\u25b6 PII GUARDRAIL \u2014 {len(mapping)} item(s) masked")
+    print(f"  Sent to Claude: {clean_short} | {clean_desc}")
+    pii_entry = log("PIIRedactor", "redact",
+                    f"{len(mapping)} masked: {', '.join(mapping) or 'none'}")   # tokens only, never values
 
-    result = triage_agent.triage_ticket(state["ticket_number"], state["short_description"], state["description"])
+    print(f"\n\u25b6 TRIAGE AGENT \u2014 {state['ticket_number']}")
+    result = triage_agent.triage_ticket(state["ticket_number"], clean_short, clean_desc)
     if result is None:
         # Model never called classify_ticket - fail safe rather than crash the graph.
         print("  ! Triage did not return a classification - defaulting to P3/Service-Desk.")
@@ -97,11 +118,14 @@ def triage_node(state: TicketState) -> dict:
                   "pii_detected": False, "reasoning": "Fallback: classification unavailable."}
 
     return {
+        "clean_short_description": clean_short,
+        "clean_description": clean_desc,
+        "pii_mapping": mapping,
         "triage_category": result["category"],
         "triage_priority": result["priority"],
         "triage_assignment_group": result["assignment_group"],
         "pii_detected": result["pii_detected"],
-        "audit_log": log("TriageAgent", "classify_ticket",
+        "audit_log": pii_entry + log("TriageAgent", "classify_ticket",
                           f"{result['category']} / {result['priority']} -> {result['assignment_group']}"),
     }
 
@@ -109,7 +133,7 @@ def triage_node(state: TicketState) -> dict:
 def call_knowledge_specialist(state: TicketState) -> dict:
     """C8: A2A call. POST /tasks -> task_id, then GET /tasks/{task_id} -> result.
     Returns {'status': 'completed', 'task_id', 'result'} or {'status': 'unavailable'|'error', 'error'}."""
-    query = f"{state['short_description']}. {state['description']}"
+    query = f"{state['clean_short_description']}. {state['clean_description']}"   # C9: masked text only
     try:
         created = requests.post(f"{A2A_URL}/tasks", timeout=90, json={
             "query": query, "ticket_number": state["ticket_number"],
@@ -131,7 +155,7 @@ def resolution_node(state: TicketState) -> dict:
     print(f"\n\u25b6 RESOLUTION AGENT \u2014 searching KB")
 
     result = resolution_agent.resolve_ticket(
-        state["ticket_number"], state["short_description"], state["description"],
+        state["ticket_number"], state["clean_short_description"], state["clean_description"],   # C9: masked
         state["triage_category"], state["triage_priority"],
     )
     update = {
@@ -195,7 +219,7 @@ def sla_node(state: TicketState) -> dict:
     is_access = "Access" in (state.get("category"), state.get("triage_category"))
     access_grant = is_access and state.get("request_type") == "Access Grant"
     if access_grant:
-        reasons.append(f"ACCESS GRANT \u2014 {state['short_description']} requires security approval")
+        reasons.append(f"ACCESS GRANT \u2014 {state['clean_short_description']} requires security approval")
 
     hitl_required = bool(reasons)
     hitl_reason = " | ".join(reasons)
@@ -275,11 +299,16 @@ def communication_node(state: TicketState) -> dict:
                     f"{state.get('triage_assignment_group')} and is being worked on.")
         final_status = "ASSIGNED"
 
+    # C9: put the real names/emails back ONLY for the system of record (ServiceNow mock)
+    message = restore(message, state.get("pii_mapping", {}))
+    sla_agent.update_ticket(ticket, "add_note", note=message)
+
     print(f"  USER MESSAGE: {message.splitlines()[0][:100]}...")
     print(f"\u2705 FINAL STATUS: {final_status}")
 
     return {"user_message": message, "final_status": final_status,
-            "audit_log": log("CommunicationAgent", "draft_message", final_status)}
+            "audit_log": log("CommunicationAgent", "post_comment",
+                             f"{final_status} - message sent to ServiceNow (PII restored)")}
 
 # -- Conditional routing -----------------------------------------------------------
 
@@ -314,7 +343,8 @@ if __name__ == "__main__":
         # P2 VPN - same wording as the Lab C4 KB match, sla_due picked for a true
         # AT_RISK reading (90 of 240 min = 37.5%) - see the SLA math note in chat.
         {"ticket_number": "INC0001001", "short_description": "VPN not connecting after password change",
-         "description": "User reports VPN client fails to connect after AD password was reset. Error: authentication failed.",
+         "description": "User John Smith (ZEN-9823) reports VPN client fails to connect after AD password was reset. "
+                        "Error: authentication failed. Call +91-9876543210.",
          "category": "Network", "priority": "P2", "sla_due": "2024-01-15 12:00:00"},
         # C7 Step 3: to test LOW confidence, change the short_description above to
         #   "Cisco Webex not launching on MacBook M2 after Sonoma update"
@@ -328,7 +358,7 @@ if __name__ == "__main__":
          "category": "Software", "priority": "P3", "sla_due": "2024-01-15 17:00:00"},
         # C7 Step 4: access grant request - always goes through HITL, whatever the priority
         {"ticket_number": "REQ-1002", "short_description": "VPN access for new contractor",
-         "description": "Contractor needs VPN access. Email: contractor@client.com",
+         "description": "Contractor Sarah Jones needs VPN access. Email: sarah.jones@client.com, username: sjones01",
          "category": "Access", "priority": "P2", "sla_due": "2024-01-15 15:00:00",
          "request_type": "Access Grant"},
     ]
@@ -338,10 +368,23 @@ if __name__ == "__main__":
         final_state = app.invoke(ticket)
         all_results.append(final_state)
 
+    # C9: one AuditLogger for the whole run -> logs/audit_trail.jsonl
+    audit_logger = AuditLogger(str(ROOT / "logs" / "audit_trail.jsonl"))
     print(f"\n\n{'=' * 60}")
-    print("AUDIT LOG")
+    print("AUDIT TRAIL  (written to logs/audit_trail.jsonl)")
     print("=" * 60)
     for result in all_results:
-        print(f"\n--- {result['ticket_number']} ({result['final_status']}) ---")
+        print(f"\n--- {result['ticket_number']}  ->  FINAL STATUS: {result['final_status']} ---")
         for entry in result["audit_log"]:
-            print(f"  [{entry['timestamp']}] {entry['agent']}: {entry['action']} \u2014 {entry['detail']}")
+            status = entry["detail"].split()[0] if entry["agent"] == "HITLGate" else "Auto"
+            audit_logger.log(entry["agent"], entry["action"], result["ticket_number"],
+                             tool=entry["action"], rationale=entry["detail"], approval_status=status)
+
+    print(f"\n\n{'=' * 60}")
+    print("PII CHECK  -  what Claude saw vs. the original ticket")
+    print("=" * 60)
+    for result in all_results:
+        print(f"\n{result['ticket_number']}")
+        print(f"  Original     : {result['description']}")
+        print(f"  Sent to Claude: {result['clean_description']}")
+        print(f"  Masked items : {', '.join(result['pii_mapping']) or 'none'}")
